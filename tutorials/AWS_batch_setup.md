@@ -88,7 +88,7 @@ Given that you've set up your batch environment properly, and your IAM credentia
 
 An example using one of our s3 buckets can be seen below. Note that your dataset must be BIDs-formatted.:
 
-        m2g_cloud participant --bucket ndmg-data --sp native --bidsdir HNU1 --jobdir ~/.ndmg/jobs/HNU1-08-21-native --modif ndmg-08-21-native --dataset HNU1
+        m2g_cloud participant --bucket ndmg-data --sp native --bidsdir HNU1 --jobdir ~/.m2g/jobs/HNU1-08-21-native --modif m2g-08-21-native --dataset HNU1
 
 Note that the above example won't work for people without access to our bucket.
 
