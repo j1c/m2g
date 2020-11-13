@@ -10,11 +10,12 @@ Theory described here: https://neurodata.io/talks/ndmg.pdf#page=21
 
 # system imports
 import os
-from multiprocessing import Pool
+from copy import deepcopy
 
 # external package imports
 import numpy as np
 import nibabel as nib
+from joblib import Parallel, delayed
 
 # dipy imports
 from dipy.tracking.streamline import Streamlines
@@ -22,10 +23,9 @@ from dipy.tracking import utils
 from dipy.tracking.local_tracking import LocalTracking
 from dipy.tracking.local_tracking import ParticleFilteringTracking
 from dipy.tracking.stopping_criterion import BinaryStoppingCriterion
-from dipy.tracking.stopping_criterion import ActStoppingCriterion
 from dipy.tracking.stopping_criterion import CmcStoppingCriterion
 
-from dipy.reconst.dti import fractional_anisotropy, TensorModel, quantize_evecs
+from dipy.reconst.dti import fractional_anisotropy, TensorModel
 from dipy.reconst.shm import CsaOdfModel
 from dipy.reconst.csdeconv import ConstrainedSphericalDeconvModel, recursive_response
 
@@ -192,34 +192,22 @@ class RunTrack:
         ValueError
             Raised when no seeds are supplied or no valid seeds were found in white-matter interface
         """
-        self.tiss_classifier = self.prep_tracking()
-        if self.mod_type == "det":
-            if self.mod_func == "csa":
-                self.mod = self.odf_mod_est()
-            elif self.mod_func == "csd":
-                self.mod = self.csd_mod_est()
-            if self.track_type == "local":
-                tracks = self.local_tracking()
-            elif self.track_type == "particle":
-                tracks = self.particle_tracking()
-            else:
-                raise ValueError(
-                    "Error: Either no seeds supplied, or no valid seeds found in white-matter interface"
-                )
-        elif self.mod_type == "prob":
-            if self.mod_func == "csa":
-                self.mod = self.odf_mod_est()
-            elif self.mod_func == "csd":
-                self.mod = self.csd_mod_est()
-            if self.track_type == "local":
-                tracks = self.local_tracking()
-            elif self.track_type == "particle":
-                tracks = self.particle_tracking()
+        # Prep tracking
+        self.prep_tracking()
+
+        if self.mod_func == "csa":
+            self.mod = self.odf_mod_est()
+        elif self.mod_func == "csd":
+            self.mod = self.csd_mod_est()
+        if self.track_type == "local":
+            tracks = self.local_tracking()
+        elif self.track_type == "particle":
+            tracks = self.particle_tracking()
         else:
             raise ValueError(
                 "Error: Either no seeds supplied, or no valid seeds found in white-matter interface"
             )
-        tracks = Streamlines([track for track in tracks if len(track) > 60])
+
         return tracks
 
     @staticmethod
@@ -249,66 +237,33 @@ class RunTrack:
         ActStoppingCriterion, CmcStoppingCriterion, or BinaryStoppingCriterion
             The resulting tissue classifier object, depending on which method you use (currently only does act)
         """
-
-        if self.track_type == "local":
-            tiss_class = "bin"
-        elif self.track_type == "particle":
-            tiss_class = "cmc"
-
         self.dwi_img = nib.load(self.dwi)
         self.data = self.dwi_img.get_data()
-        # Loads mask and ensures it's a true binary mask
-        self.mask_img = nib.load(self.nodif_B0_mask)
-        self.mask = self.mask_img.get_data() > 0
+
         # Load tissue maps and prepare tissue classifier
         self.gm_mask = nib.load(self.gm_in_dwi)
         self.gm_mask_data = self.gm_mask.get_data()
         self.wm_mask = nib.load(self.wm_in_dwi)
         self.wm_mask_data = self.wm_mask.get_data()
         self.wm_in_dwi_data = nib.load(self.wm_in_dwi).get_data().astype("bool")
-        if tiss_class == "act":
-            self.vent_csf_in_dwi = nib.load(self.vent_csf_in_dwi)
-            self.vent_csf_in_dwi_data = self.vent_csf_in_dwi.get_data()
-            self.background = np.ones(self.gm_mask.shape)
-            self.background[
-                (self.gm_mask_data + self.wm_mask_data + self.vent_csf_in_dwi_data) > 0
-            ] = 0
-            self.include_map = self.wm_mask_data
-            self.include_map[self.background > 0] = 0
-            self.exclude_map = self.vent_csf_in_dwi_data
-            self.tiss_classifier = ActStoppingCriterion(
-                self.include_map, self.exclude_map
-            )
-        elif tiss_class == "bin":
-            self.tiss_classifier = BinaryStoppingCriterion(self.wm_in_dwi_data)
-            # self.tiss_classifier = BinaryStoppingCriterion(self.mask)
-        elif tiss_class == "cmc":
+
+        if self.track_type == "local":
+            self.tiss_classifier_kwargs = dict(mask=self.wm_in_dwi_data)
+        elif self.track_type == "particle":
             self.vent_csf_in_dwi = nib.load(self.vent_csf_in_dwi)
             self.vent_csf_in_dwi_data = self.vent_csf_in_dwi.get_data()
             voxel_size = np.average(self.wm_mask.get_header()["pixdim"][1:4])
             step_size = 0.2
-            self.tiss_classifier = CmcStoppingCriterion.from_pve(
-                self.wm_mask_data,
-                self.gm_mask_data,
-                self.vent_csf_in_dwi_data,
+
+            self.tiss_classifier_kwargs = dict(
+                wm_map=self.wm_mask_data,
+                gm_map=self.gm_mask_data,
+                csf_map=self.vent_csf_in_dwi_data,
                 step_size=step_size,
                 average_voxel_size=voxel_size,
             )
         else:
             pass
-        return self.tiss_classifier
-
-    @timer
-    def tens_mod_est(self):
-
-        print("Fitting tensor model...")
-        self.model = TensorModel(self.gtab)
-        self.ten = self.model.fit(self.data, self.wm_in_dwi_data)
-        self.fa = self.ten.fa
-        self.fa[np.isnan(self.fa)] = 0
-        self.sphere = get_sphere("repulsion724")
-        self.ind = quantize_evecs(self.ten.evecs, self.sphere.vertices)
-        return self.ten
 
     @timer
     def odf_mod_est(self):
@@ -349,8 +304,6 @@ class RunTrack:
         # Common arguments for local tracking
         # Seeds are added later for multiprocessing support
         tracking_kwargs = dict(
-            stopping_criterion=self.tiss_classifier,
-            # seeds=self.seeds,
             affine=self.stream_affine,
             step_size=0.5,
             return_all=True,
@@ -420,27 +373,13 @@ class RunTrack:
             tracking_kwargs["direction_getter"] = self.pdg
 
         print("Reconstructing tractogram streamlines...")
-
-        def worker(seeds):
-            """For sending work with split seeds"""
-
-            # Initialization of LocalTracking. The computation happens in the next step.
-            streamlines_generator = LocalTracking(
-                **tracking_kwargs, seeds=seeds
-            )
-
-            # Generate streamlines object
-            streamlines = Streamlines(streamlines_generator)
-
-            return streamlines
-
         # Start parallel streamline generation
-        pool = Pool(self.n_cpus)
-        streams = pool.map(
-            worker, [self.seeds[i::self.n_cpus] for i in range(self.n_cpus)]
-        )
-        pool.close()
-        pool.join()
+        streams = Parallel(self.n_cpus)(delayed(worker)(
+            seeds=self.seeds[i::self.n_cpus],
+            track_type='local',
+            tiss_classifier_kwargs=self.tiss_classifier_kwargs,
+            tracking_kwargs=tracking_kwargs
+        ) for i in range(self.n_cpus))
 
         # Concatenate streamlines
         self.streamlines = Streamlines()
@@ -454,7 +393,6 @@ class RunTrack:
         # Common arguments for particle tracking
         # Seeds are added later for multiprocessing support
         tracking_kwargs = dict(
-            stopping_criterion=self.tiss_classifier,
             affine=self.stream_affine,
             step_size=0.5,
             maxlen=1000,
@@ -531,27 +469,13 @@ class RunTrack:
             tracking_kwargs["direction_getter"] = self.pdg
 
         print("Reconstructing tractogram streamlines...")
-
-        def worker(seeds):
-            """For sending work with split seeds"""
-
-            # Initialization of LocalTracking. The computation happens in the next step.
-            streamlines_generator = ParticleFilteringTracking(
-                **tracking_kwargs, seeds=seeds
-            )
-
-            # Generate streamlines object
-            streamlines = Streamlines(streamlines_generator)
-
-            return streamlines
-
         # Start parallel streamline generation
-        pool = Pool(self.n_cpus)
-        streams = pool.map(
-            worker, [self.seeds[i::self.n_cpus] for i in range(self.n_cpus)]
-        )
-        pool.close()
-        pool.join()
+        streams = Parallel(self.n_cpus)(delayed(worker)(
+            seeds=self.seeds[i::self.n_cpus],
+            track_type='particle',
+            tiss_classifier_kwargs=self.tiss_classifier_kwargs,
+            tracking_kwargs=tracking_kwargs
+        ) for i in range(self.n_cpus))
 
         # Concatenate streamlines
         self.streamlines = Streamlines()
@@ -559,3 +483,27 @@ class RunTrack:
             self.streamlines.extend(stream)
 
         return self.streamlines
+
+
+def worker(seeds, track_type, tiss_classifier_kwargs, tracking_kwargs):
+    if track_type == 'local':
+        tracker = LocalTracking
+        stopping_criterion = BinaryStoppingCriterion(**tiss_classifier_kwargs)
+    elif track_type == 'particle':
+        tracker = ParticleFilteringTracking
+        stopping_criterion = CmcStoppingCriterion(**tiss_classifier_kwargs)
+
+    # Needs copy for parallelization
+    tracking_kwargs["direction_getter"] = deepcopy(tracking_kwargs["direction_getter"])
+    tracking_kwargs["stopping_criterion"] = stopping_criterion
+
+    # Initialization of tracking. The computation happens in the next step.
+    streamlines_generator = tracker(seeds=seeds, **tracking_kwargs)
+
+    # Generate streamlines object
+    streamlines = Streamlines(streamlines_generator)
+
+    # Filter out short tracks
+    filtered_streamlines = [track for track in streamlines if len(track) > 60]
+
+    return filtered_streamlines
